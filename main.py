@@ -1,7 +1,9 @@
 from pathlib import Path
 import subprocess
+
 import cv2
 import numpy as np
+import onnxruntime as ort
 
 from insightface.app import FaceAnalysis
 from insightface.model_zoo import get_model
@@ -11,7 +13,9 @@ from insightface.model_zoo import get_model
 # CONFIGURATION
 # ============================================================
 
-BASE_DIR = Path.cwd()
+# Use the location of this Python file, NOT the current
+# Jupyter/Streamlit working directory.
+BASE_DIR = Path(__file__).resolve().parent
 
 MODEL_DIR = BASE_DIR / "models"
 INPUT_DIR = BASE_DIR / "input"
@@ -22,32 +26,16 @@ GENDER_MODEL_PATH = MODEL_DIR / "gender_net.onnx"
 
 MALE_SOURCE_PATH = INPUT_DIR / "male_source.jpg"
 FEMALE_SOURCE_PATH = INPUT_DIR / "female_source.jpg"
-
 TARGET_VIDEO_PATH = INPUT_DIR / "target.mp4"
 
 FINAL_OUTPUT_PATH = OUTPUT_DIR / "synthetic_video.mp4"
 TEMP_VIDEO_PATH = OUTPUT_DIR / "temp_no_audio.mp4"
 
-# ------------------------------------------------------------
-# Gender settings
-# ------------------------------------------------------------
-
-# Do not swap if the classifier is not confident enough.
 GENDER_CONFIDENCE_THRESHOLD = 0.70
 
-# Expected gender model output:
-#
+# Expected output:
 # index 0 = female
 # index 1 = male
-#
-# If your particular model uses the opposite order,
-# change this to:
-#
-# GENDER_INDEX = {
-#     "male": 0,
-#     "female": 1
-# }
-#
 GENDER_INDEX = {
     "female": 0,
     "male": 1
@@ -60,20 +48,49 @@ WATERMARK_TEXT = "AI-GENERATED / SYNTHETIC MEDIA"
 # CREATE DIRECTORIES
 # ============================================================
 
-MODEL_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+INPUT_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-INPUT_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
 
-OUTPUT_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
+# ============================================================
+# MODEL CHECK
+# ============================================================
+
+def check_required_models():
+
+    missing = []
+
+    if not SWAP_MODEL_PATH.exists():
+        missing.append(str(SWAP_MODEL_PATH))
+
+    if not GENDER_MODEL_PATH.exists():
+        missing.append(str(GENDER_MODEL_PATH))
+
+    if missing:
+
+        message = (
+            "\nRequired model file(s) missing:\n\n"
+            + "\n".join(missing)
+            + "\n\nExpected structure:\n"
+            f"{MODEL_DIR}/\n"
+            "    inswapper_128.onnx\n"
+            "    gender_net.onnx\n"
+        )
+
+        raise FileNotFoundError(message)
+
+    print("\nModel files found:")
+
+    print(
+        f"inswapper_128.onnx: "
+        f"{SWAP_MODEL_PATH.stat().st_size / (1024 * 1024):.2f} MB"
+    )
+
+    print(
+        f"gender_net.onnx: "
+        f"{GENDER_MODEL_PATH.stat().st_size / (1024 * 1024):.2f} MB"
+    )
 
 
 # ============================================================
@@ -82,26 +99,69 @@ OUTPUT_DIR.mkdir(
 
 class GenderClassifier:
 
-    def __init__(
-        self,
-        model_path=GENDER_MODEL_PATH
-    ):
+    def __init__(self, model_path=GENDER_MODEL_PATH):
 
-        model_path = Path(model_path)
+        self.model_path = Path(model_path)
 
-        if not model_path.exists():
+        if not self.model_path.exists():
 
             raise FileNotFoundError(
-                f"\nGender model not found:\n"
-                f"{model_path}"
+                f"Gender model not found:\n"
+                f"{self.model_path}"
             )
 
-        self.net = cv2.dnn.readNetFromONNX(
-            str(model_path)
+        print("\nLoading gender model...")
+
+        try:
+
+            self.session = ort.InferenceSession(
+                str(self.model_path),
+                providers=["CPUExecutionProvider"]
+            )
+
+        except Exception as error:
+
+            raise RuntimeError(
+                "\nCould not load gender_net.onnx with "
+                "ONNX Runtime.\n\n"
+                "The file may be corrupted, incomplete, "
+                "or not actually be a valid ONNX model.\n\n"
+                f"Model: {self.model_path}\n\n"
+                f"Original error:\n{error}"
+            )
+
+        inputs = self.session.get_inputs()
+        outputs = self.session.get_outputs()
+
+        if not inputs:
+
+            raise RuntimeError(
+                "Gender ONNX model has no input."
+            )
+
+        if not outputs:
+
+            raise RuntimeError(
+                "Gender ONNX model has no output."
+            )
+
+        self.input_name = inputs[0].name
+        self.output_name = outputs[0].name
+
+        self.input_shape = inputs[0].shape
+
+        print("Gender model loaded.")
+
+        print(
+            f"Gender input: {self.input_name}"
         )
 
         print(
-            "Gender classification model loaded."
+            f"Gender output: {self.output_name}"
+        )
+
+        print(
+            f"Gender input shape: {self.input_shape}"
         )
 
 
@@ -109,11 +169,7 @@ class GenderClassifier:
     # CROP FACE
     # ========================================================
 
-    def crop_face(
-        self,
-        image,
-        face
-    ):
+    def crop_face(self, image, face):
 
         h, w = image.shape[:2]
 
@@ -129,10 +185,7 @@ class GenderClassifier:
 
             return None
 
-        crop = image[
-            y1:y2,
-            x1:x2
-        ]
+        crop = image[y1:y2, x1:x2]
 
         if crop.size == 0:
 
@@ -142,28 +195,10 @@ class GenderClassifier:
 
 
     # ========================================================
-    # PREDICT GENDER
+    # PREPARE INPUT
     # ========================================================
 
-    def predict(
-        self,
-        image,
-        face
-    ):
-
-        crop = self.crop_face(
-            image,
-            face
-        )
-
-        if crop is None:
-
-            return "unknown", 0.0
-
-
-        # ----------------------------------------------------
-        # Prepare image
-        # ----------------------------------------------------
+    def prepare_input(self, crop):
 
         blob = cv2.dnn.blobFromImage(
             crop,
@@ -174,53 +209,68 @@ class GenderClassifier:
             crop=False
         )
 
-        self.net.setInput(blob)
+        return blob.astype(np.float32)
 
-        prediction = self.net.forward()
+
+    # ========================================================
+    # PREDICT GENDER
+    # ========================================================
+
+    def predict(self, image, face):
+
+        crop = self.crop_face(
+            image,
+            face
+        )
+
+        if crop is None:
+
+            return "unknown", 0.0
+
+        try:
+
+            blob = self.prepare_input(crop)
+
+            prediction = self.session.run(
+                [self.output_name],
+                {
+                    self.input_name: blob
+                }
+            )[0]
+
+        except Exception as error:
+
+            print(
+                f"\nGender inference error: {error}"
+            )
+
+            return "unknown", 0.0
 
         prediction = np.asarray(
-            prediction
+            prediction,
+            dtype=np.float32
         ).flatten()
-
-
-        # ----------------------------------------------------
-        # Check model output
-        # ----------------------------------------------------
 
         if len(prediction) < 2:
 
             print(
                 "\nWARNING: Gender model returned "
-                "less than two outputs."
+                f"{len(prediction)} output values."
             )
 
             return "unknown", 0.0
 
-
         # ----------------------------------------------------
-        # Get class scores
+        # Get two class scores
         # ----------------------------------------------------
 
         female_score = float(
-            prediction[
-                GENDER_INDEX["female"]
-            ]
+            prediction[GENDER_INDEX["female"]]
         )
 
         male_score = float(
-            prediction[
-                GENDER_INDEX["male"]
-            ]
+            prediction[GENDER_INDEX["male"]]
         )
-
-
-        # ----------------------------------------------------
-        # Convert to probabilities if required
-        # ----------------------------------------------------
-        #
-        # Some models return logits rather than probabilities.
-        # If values don't look like probabilities, use softmax.
-        #
 
         scores = np.array(
             [
@@ -230,15 +280,22 @@ class GenderClassifier:
             dtype=np.float32
         )
 
+        # ----------------------------------------------------
+        # Convert logits to probabilities if necessary
+        # ----------------------------------------------------
+
         if (
             np.any(scores < 0.0)
             or np.any(scores > 1.0)
             or abs(float(scores.sum()) - 1.0) > 0.10
         ):
 
-            exp_scores = np.exp(
-                scores - np.max(scores)
+            shifted = (
+                scores -
+                np.max(scores)
             )
+
+            exp_scores = np.exp(shifted)
 
             probabilities = (
                 exp_scores /
@@ -253,12 +310,11 @@ class GenderClassifier:
                 probabilities[1]
             )
 
-
         # ----------------------------------------------------
         # Select gender
         # ----------------------------------------------------
 
-        if male_score > female_score:
+        if male_score >= female_score:
 
             gender = "male"
             confidence = male_score
@@ -268,7 +324,6 @@ class GenderClassifier:
             gender = "female"
             confidence = female_score
 
-
         # ----------------------------------------------------
         # Confidence check
         # ----------------------------------------------------
@@ -276,7 +331,6 @@ class GenderClassifier:
         if confidence < GENDER_CONFIDENCE_THRESHOLD:
 
             return "unknown", confidence
-
 
         return gender, confidence
 
@@ -287,30 +341,21 @@ class GenderClassifier:
 
 class FaceSwapper:
 
-    def __init__(
-        self,
-        model_path=SWAP_MODEL_PATH
-    ):
+    def __init__(self, model_path=SWAP_MODEL_PATH):
 
-        model_path = Path(
-            model_path
-        )
+        self.model_path = Path(model_path)
 
-        if not model_path.exists():
+        if not self.model_path.exists():
 
             raise FileNotFoundError(
-                f"\nFace swap model not found:\n"
-                f"{model_path}"
+                f"Face swap model not found:\n"
+                f"{self.model_path}"
             )
 
-
-        print(
-            "\nLoading InsightFace..."
-        )
-
+        print("\nLoading InsightFace...")
 
         # ----------------------------------------------------
-        # Face detection
+        # Face Analysis
         # ----------------------------------------------------
 
         self.app = FaceAnalysis(
@@ -325,45 +370,41 @@ class FaceSwapper:
             det_size=(640, 640)
         )
 
-
-        print(
-            "Face analysis loaded."
-        )
-
+        print("Face analysis loaded.")
 
         # ----------------------------------------------------
-        # Face swap model
+        # Face Swap Model
         # ----------------------------------------------------
 
-        print(
-            "Loading face swap model..."
-        )
+        print("Loading face swap model...")
 
-        self.swapper = get_model(
-            str(model_path),
-            providers=[
-                "CPUExecutionProvider"
-            ]
-        )
+        try:
 
+            self.swapper = get_model(
+                str(self.model_path),
+                providers=[
+                    "CPUExecutionProvider"
+                ]
+            )
 
-        print(
-            "Face swap model loaded."
-        )
+        except Exception as error:
+
+            raise RuntimeError(
+                "\nCould not load inswapper_128.onnx.\n\n"
+                f"Model: {self.model_path}\n\n"
+                f"Original error:\n{error}"
+            )
+
+        print("Face swap model loaded.")
 
 
     # ========================================================
     # GET LARGEST FACE
     # ========================================================
 
-    def get_largest_face(
-        self,
-        image
-    ):
+    def get_largest_face(self, image):
 
-        faces = self.app.get(
-            image
-        )
+        faces = self.app.get(image)
 
         if len(faces) == 0:
 
@@ -444,29 +485,23 @@ def add_watermark(
 
     y = margin + text_height
 
-
     # --------------------------------------------------------
     # Background
     # --------------------------------------------------------
 
     cv2.rectangle(
         frame,
-
         (
             x - 6,
             y - text_height - 6
         ),
-
         (
             x + text_width + 6,
             y + baseline + 6
         ),
-
         (20, 20, 20),
-
         -1
     )
-
 
     # --------------------------------------------------------
     # Text
@@ -500,33 +535,16 @@ def process_video(
     progress_callback=None
 ):
 
-    input_video = str(
-        input_video
-    )
+    input_video = str(input_video)
+    output_video = str(output_video)
 
-    output_video = str(
-        output_video
-    )
-
-
-    # --------------------------------------------------------
-    # Open video
-    # --------------------------------------------------------
-
-    cap = cv2.VideoCapture(
-        input_video
-    )
+    cap = cv2.VideoCapture(input_video)
 
     if not cap.isOpened():
 
         raise RuntimeError(
             "Could not open input video."
         )
-
-
-    # --------------------------------------------------------
-    # Video information
-    # --------------------------------------------------------
 
     fps = cap.get(
         cv2.CAP_PROP_FPS
@@ -550,11 +568,9 @@ def process_video(
         )
     )
 
-
     if fps <= 0:
 
         fps = 25
-
 
     if width <= 0 or height <= 0:
 
@@ -563,7 +579,6 @@ def process_video(
         raise RuntimeError(
             "Invalid video dimensions."
         )
-
 
     # --------------------------------------------------------
     # Video writer
@@ -580,7 +595,6 @@ def process_video(
         (width, height)
     )
 
-
     if not writer.isOpened():
 
         cap.release()
@@ -589,13 +603,9 @@ def process_video(
             "Could not create output video."
         )
 
-
     frame_number = 0
 
-    print(
-        "\nProcessing video..."
-    )
-
+    print("\nProcessing video...")
 
     try:
 
@@ -607,7 +617,6 @@ def process_video(
 
                 break
 
-
             # ------------------------------------------------
             # Detect faces
             # ------------------------------------------------
@@ -618,9 +627,8 @@ def process_video(
 
             result = frame.copy()
 
-
             # ------------------------------------------------
-            # Process every detected face
+            # Process detected faces
             # ------------------------------------------------
 
             for target_face in faces:
@@ -632,11 +640,6 @@ def process_video(
                     )
                 )
 
-
-                # ============================================
-                # MALE → MALE
-                # ============================================
-
                 if gender == "male":
 
                     result = (
@@ -646,11 +649,6 @@ def process_video(
                             male_source_face
                         )
                     )
-
-
-                # ============================================
-                # FEMALE → FEMALE
-                # ============================================
 
                 elif gender == "female":
 
@@ -662,51 +660,26 @@ def process_video(
                         )
                     )
 
-
-                # ============================================
-                # UNKNOWN → NO SWAP
-                # ============================================
-
-                else:
-
-                    continue
-
-
             # ------------------------------------------------
-            # Mandatory disclosure
+            # Add disclosure watermark
             # ------------------------------------------------
 
             result = add_watermark(
                 result
             )
 
-
-            # ------------------------------------------------
-            # Write frame
-            # ------------------------------------------------
-
-            writer.write(
-                result
-            )
+            writer.write(result)
 
             frame_number += 1
-
-
-            # ------------------------------------------------
-            # Progress
-            # ------------------------------------------------
 
             progress = (
                 frame_number /
                 max(total_frames, 1)
             )
 
-
             if progress_callback:
 
-                progress_callback(
-                    progress
-                )
+                progress_callback(progress)
 
             else:
 
@@ -716,17 +689,14 @@ def process_video(
                     end=""
                 )
 
-
     finally:
 
         cap.release()
         writer.release()
 
-
     print(
         "\n\nVideo processing completed."
     )
-
 
     return output_video
 
@@ -776,11 +746,9 @@ def combine_video_audio(
         str(final_output)
     ]
 
-
     print(
         "\nCombining original audio..."
     )
-
 
     result = subprocess.run(
         command,
@@ -789,7 +757,6 @@ def combine_video_audio(
         text=True
     )
 
-
     if result.returncode != 0:
 
         raise RuntimeError(
@@ -797,15 +764,11 @@ def combine_video_audio(
             + result.stderr[-3000:]
         )
 
-
     print(
         "Audio successfully restored."
     )
 
-
-    return str(
-        final_output
-    )
+    return str(final_output)
 
 
 # ============================================================
@@ -831,9 +794,8 @@ def create_synthetic_video(
         target_video_path
     )
 
-
     # --------------------------------------------------------
-    # Validate files
+    # Validate input files
     # --------------------------------------------------------
 
     if not male_source_path.exists():
@@ -843,14 +805,12 @@ def create_synthetic_video(
             f"{male_source_path}"
         )
 
-
     if not female_source_path.exists():
 
         raise FileNotFoundError(
             f"Female source image not found:\n"
             f"{female_source_path}"
         )
-
 
     if not target_video_path.exists():
 
@@ -859,9 +819,14 @@ def create_synthetic_video(
             f"{target_video_path}"
         )
 
+    # --------------------------------------------------------
+    # Check models
+    # --------------------------------------------------------
+
+    check_required_models()
 
     # --------------------------------------------------------
-    # Load models
+    # Load models ONCE
     # --------------------------------------------------------
 
     face_swapper = FaceSwapper(
@@ -871,7 +836,6 @@ def create_synthetic_video(
     gender_classifier = GenderClassifier(
         GENDER_MODEL_PATH
     )
-
 
     # --------------------------------------------------------
     # Read male source
@@ -887,7 +851,6 @@ def create_synthetic_video(
             "Could not read male source image."
         )
 
-
     # --------------------------------------------------------
     # Read female source
     # --------------------------------------------------------
@@ -901,7 +864,6 @@ def create_synthetic_video(
         raise ValueError(
             "Could not read female source image."
         )
-
 
     # --------------------------------------------------------
     # Detect source faces
@@ -917,7 +879,6 @@ def create_synthetic_video(
         )
     )
 
-
     print(
         "Detecting female source face..."
     )
@@ -928,24 +889,17 @@ def create_synthetic_video(
         )
     )
 
-
     # --------------------------------------------------------
-    # Temporary output
+    # Delete old temporary output
     # --------------------------------------------------------
 
     if TEMP_VIDEO_PATH.exists():
 
         TEMP_VIDEO_PATH.unlink()
 
-
-    # --------------------------------------------------------
-    # Final output
-    # --------------------------------------------------------
-
     if FINAL_OUTPUT_PATH.exists():
 
         FINAL_OUTPUT_PATH.unlink()
-
 
     # --------------------------------------------------------
     # Process video
@@ -968,7 +922,6 @@ def create_synthetic_video(
         progress_callback
     )
 
-
     # --------------------------------------------------------
     # Restore original audio
     # --------------------------------------------------------
@@ -982,18 +935,16 @@ def create_synthetic_video(
         FINAL_OUTPUT_PATH
     )
 
-
     # --------------------------------------------------------
-    # Remove temporary file
+    # Remove temporary video
     # --------------------------------------------------------
 
     if TEMP_VIDEO_PATH.exists():
 
         TEMP_VIDEO_PATH.unlink()
 
-
     # --------------------------------------------------------
-    # Verify
+    # Verify final output
     # --------------------------------------------------------
 
     if not FINAL_OUTPUT_PATH.exists():
@@ -1002,7 +953,6 @@ def create_synthetic_video(
             "Final video was not created."
         )
 
-
     print(
         "\nFinal video:"
     )
@@ -1010,7 +960,6 @@ def create_synthetic_video(
     print(
         FINAL_OUTPUT_PATH
     )
-
 
     return str(
         FINAL_OUTPUT_PATH
@@ -1021,13 +970,9 @@ def create_synthetic_video(
 # PROGRESS
 # ============================================================
 
-def show_progress(
-    progress
-):
+def show_progress(progress):
 
-    percentage = (
-        progress * 100
-    )
+    percentage = progress * 100
 
     print(
         f"\rProcessing: "
@@ -1054,6 +999,9 @@ if __name__ == "__main__":
 
     print("=" * 60)
 
+    print(
+        f"\nProject directory:\n{BASE_DIR}"
+    )
 
     try:
 
@@ -1068,7 +1016,6 @@ if __name__ == "__main__":
             show_progress
         )
 
-
         print("\n")
 
         print("=" * 60)
@@ -1082,7 +1029,6 @@ if __name__ == "__main__":
         print(
             f"\nOutput:\n{output}"
         )
-
 
     except Exception as error:
 
