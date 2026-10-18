@@ -1,5 +1,5 @@
-numpy
-python
 streamlit
+opencv-python-headless
+numpy
+insightface
 onnxruntime
-cv2
