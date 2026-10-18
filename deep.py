@@ -4,7 +4,7 @@ import tempfile
 import subprocess
 import cv2
 import numpy as np
-import os
+import time
 
 
 # ============================================================
@@ -19,16 +19,17 @@ st.set_page_config(
 
 
 # ============================================================
-# BACKEND
+# CONFIG
 # ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+MODEL_PATH = BASE_DIR / "models" / "gender_net.onnx"
 
 WATERMARK_TEXT = "AI-GENERATED / SYNTHETIC MEDIA"
 
 GENDER_CONFIDENCE_THRESHOLD = 0.70
 
-# gender_net.onnx expected:
-# 0 = female
-# 1 = male
 GENDER_INDEX = {
     "female": 0,
     "male": 1
@@ -55,10 +56,13 @@ class FaceDetector:
         if self.detector.empty():
 
             raise RuntimeError(
-                "OpenCV Haar Cascade could not be loaded."
+                "Could not load Haar Cascade."
             )
 
     def detect(self, image):
+
+        if image is None:
+            return []
 
         gray = cv2.cvtColor(
             image,
@@ -93,18 +97,18 @@ class FaceDetector:
 
         faces = self.detect(image)
 
-        if len(faces) == 0:
+        if not faces:
 
             raise ValueError(
-                "No face detected in source image."
+                "No face detected."
             )
 
         return max(
             faces,
-            key=lambda box:
-            (box[2] - box[0])
+            key=lambda b:
+            (b[2] - b[0])
             *
-            (box[3] - box[1])
+            (b[3] - b[1])
         )
 
 
@@ -116,15 +120,19 @@ class GenderClassifier:
 
     def __init__(self, model_path):
 
+        model_path = Path(model_path)
+
+        if not model_path.exists():
+
+            raise FileNotFoundError(
+                f"Model not found:\n{model_path}"
+            )
+
         self.net = cv2.dnn.readNetFromONNX(
             str(model_path)
         )
 
-    def crop_face(
-        self,
-        image,
-        bbox
-    ):
+    def crop_face(self, image, bbox):
 
         x1, y1, x2, y2 = bbox
 
@@ -132,30 +140,20 @@ class GenderClassifier:
 
         x1 = max(0, x1)
         y1 = max(0, y1)
-
         x2 = min(w, x2)
         y2 = min(h, y2)
 
         if x2 <= x1 or y2 <= y1:
-
             return None
 
-        face = image[
-            y1:y2,
-            x1:x2
-        ]
+        face = image[y1:y2, x1:x2]
 
         if face.size == 0:
-
             return None
 
         return face
 
-    def predict(
-        self,
-        image,
-        bbox
-    ):
+    def predict(self, image, bbox):
 
         face = self.crop_face(
             image,
@@ -166,13 +164,46 @@ class GenderClassifier:
 
             return "unknown", 0.0
 
-        blob = cv2.dnn.blobFromImage(
+        # RGB
+        face = cv2.cvtColor(
             face,
-            scalefactor=1.0,
-            size=(224, 224),
-            mean=(104, 117, 123),
-            swapRB=False,
-            crop=False
+            cv2.COLOR_BGR2RGB
+        )
+
+        # 224 x 224
+        face = cv2.resize(
+            face,
+            (224, 224),
+            interpolation=cv2.INTER_AREA
+        )
+
+        # 0-1
+        face = (
+            face.astype(
+                np.float32
+            ) / 255.0
+        )
+
+        # Normalize
+        face = (
+            face - 0.5
+        ) / 0.5
+
+        # HWC -> CHW
+        face = np.transpose(
+            face,
+            (2, 0, 1)
+        )
+
+        # Batch
+        blob = np.expand_dims(
+            face,
+            axis=0
+        )
+
+        blob = np.ascontiguousarray(
+            blob,
+            dtype=np.float32
         )
 
         self.net.setInput(blob)
@@ -180,59 +211,50 @@ class GenderClassifier:
         output = self.net.forward()
 
         scores = np.asarray(
-            output
+            output,
+            dtype=np.float32
         ).flatten()
 
         if len(scores) < 2:
 
             return "unknown", 0.0
 
-        female_score = float(
-            scores[GENDER_INDEX["female"]]
-        )
-
-        male_score = float(
-            scores[GENDER_INDEX["male"]]
-        )
-
-        values = np.array(
-            [
-                female_score,
-                male_score
-            ],
-            dtype=np.float32
-        )
+        values = scores[:2]
 
         # Convert logits to probabilities
         if (
-            np.any(values < 0.0)
-            or np.any(values > 1.0)
+            np.any(values < 0)
+            or np.any(values > 1)
             or abs(
-                float(values.sum()) - 1.0
+                float(values.sum()) - 1
             ) > 0.10
         ):
 
-            values = np.exp(
-                values - np.max(values)
-            )
-
             values = (
-                values /
-                np.sum(values)
+                values
+                - np.max(values)
             )
 
-        female_score = float(values[0])
-        male_score = float(values[1])
+            values = np.exp(values)
 
-        if male_score > female_score:
+            total = np.sum(values)
+
+            if total > 0:
+
+                values /= total
+
+        female = float(values[0])
+        male = float(values[1])
+
+        if male > female:
 
             gender = "male"
-            confidence = male_score
+            confidence = male
 
         else:
 
             gender = "female"
-            confidence = female_score
+            confidence = female
 
         if confidence < GENDER_CONFIDENCE_THRESHOLD:
 
@@ -242,79 +264,64 @@ class GenderClassifier:
 
 
 # ============================================================
-# SOURCE FACE EXTRACTION
+# SYNTHETIC FACE TRANSFORMATION
 # ============================================================
 
-def extract_source_face(
-    image,
-    bbox
+def apply_synthetic_effect(
+    frame,
+    bbox,
+    gender
 ):
 
     x1, y1, x2, y2 = bbox
 
-    face = image[
+    face = frame[
         y1:y2,
         x1:x2
     ]
 
     if face.size == 0:
-
-        raise ValueError(
-            "Source face could not be extracted."
-        )
-
-    return face
-
-
-# ============================================================
-# FACE REGION REPLACEMENT
-# ============================================================
-
-def replace_face(
-    frame,
-    target_bbox,
-    source_face
-):
-
-    x1, y1, x2, y2 = target_bbox
-
-    width = x2 - x1
-    height = y2 - y1
-
-    if width <= 0 or height <= 0:
-
         return frame
 
-    # Resize source face
-    source = cv2.resize(
-        source_face,
-        (width, height),
+    h, w = face.shape[:2]
+
+    # Pixelation
+    small_w = max(
+        8,
+        w // 12
+    )
+
+    small_h = max(
+        8,
+        h // 12
+    )
+
+    small = cv2.resize(
+        face,
+        (small_w, small_h),
         interpolation=cv2.INTER_AREA
     )
 
-    target = frame[
-        y1:y2,
-        x1:x2
-    ]
+    pixelated = cv2.resize(
+        small,
+        (w, h),
+        interpolation=cv2.INTER_NEAREST
+    )
 
-    if target.size == 0:
-
-        return frame
-
-    # Create elliptical face mask
+    # Elliptical mask
     mask = np.zeros(
-        (height, width),
+        (h, w),
         dtype=np.uint8
     )
 
     center = (
-        width // 2,
-        height // 2
+        w // 2,
+        h // 2
     )
 
     axes = (
-        max(1, int(width * 0.42)),
-        max(1, int(height * 0.47))
+        max(1, int(w * 0.45)),
+        max(1, int(h * 0.48))
     )
 
     cv2.ellipse(
@@ -328,35 +335,26 @@ def replace_face(
         -1
     )
 
-    # Smooth mask
-    blur_size = 21
-
-    if width < 40 or height < 40:
-
-        blur_size = 9
-
     mask = cv2.GaussianBlur(
         mask,
-        (
-            blur_size,
-            blur_size
-        ),
+        (21, 21),
         0
     )
 
     alpha = (
-        mask.astype(np.float32)
-        / 255.0
+        mask.astype(
+            np.float32
+        ) / 255.0
     )
 
     alpha = alpha[:, :, None]
 
     blended = (
-        source.astype(np.float32)
+        pixelated.astype(np.float32)
         * alpha
         +
-        target.astype(np.float32)
-        * (1.0 - alpha)
+        face.astype(np.float32)
+        * (1 - alpha)
     )
 
     blended = np.clip(
@@ -379,21 +377,18 @@ def replace_face(
 
 def add_watermark(frame):
 
-    height, width = frame.shape[:2]
+    h, w = frame.shape[:2]
 
     font = cv2.FONT_HERSHEY_SIMPLEX
 
     scale = max(
         0.45,
-        min(width, height) / 1200
+        min(w, h) / 1200
     )
 
     thickness = 2
 
-    (
-        text_width,
-        text_height
-    ), baseline = cv2.getTextSize(
+    (tw, th), baseline = cv2.getTextSize(
         WATERMARK_TEXT,
         font,
         scale,
@@ -402,29 +397,26 @@ def add_watermark(frame):
 
     margin = max(
         10,
-        width // 100
+        w // 100
     )
 
     x = margin
+    y = margin + th
 
-    y = margin + text_height
-
-    # Background
     cv2.rectangle(
         frame,
         (
             x - 6,
-            y - text_height - 6
+            y - th - 6
         ),
         (
-            x + text_width + 6,
+            x + tw + 6,
             y + baseline + 6
         ),
         (20, 20, 20),
         -1
     )
 
-    # Text
     cv2.putText(
         frame,
         WATERMARK_TEXT,
@@ -440,16 +432,14 @@ def add_watermark(frame):
 
 
 # ============================================================
-# VIDEO PROCESSING
+# VIDEO PROCESSOR
 # ============================================================
 
 def process_video(
     input_video,
     output_video,
     detector,
-    gender_classifier,
-    male_source_face,
-    female_source_face,
+    classifier,
     progress_callback=None
 ):
 
@@ -460,7 +450,7 @@ def process_video(
     if not cap.isOpened():
 
         raise RuntimeError(
-            "Could not open target video."
+            "Could not open video."
         )
 
     fps = cap.get(
@@ -479,23 +469,14 @@ def process_video(
         )
     )
 
-    total_frames = int(
+    total = int(
         cap.get(
             cv2.CAP_PROP_FRAME_COUNT
         )
     )
 
     if fps <= 0:
-
         fps = 25
-
-    if width <= 0 or height <= 0:
-
-        cap.release()
-
-        raise RuntimeError(
-            "Invalid video dimensions."
-        )
 
     fourcc = cv2.VideoWriter_fourcc(
         *"mp4v"
@@ -513,7 +494,7 @@ def process_video(
         cap.release()
 
         raise RuntimeError(
-            "Could not create temporary video."
+            "Could not create output video."
         )
 
     frame_number = 0
@@ -522,48 +503,39 @@ def process_video(
 
         while True:
 
-            success, frame = cap.read()
+            ok, frame = cap.read()
 
-            if not success:
-
+            if not ok:
                 break
 
-            # Detect faces
             faces = detector.detect(
                 frame
             )
 
             result = frame.copy()
 
-            # Process each face
             for bbox in faces:
 
                 gender, confidence = (
-                    gender_classifier.predict(
+                    classifier.predict(
                         frame,
                         bbox
                     )
                 )
 
-                # Male → Male
-                if gender == "male":
+                if gender in (
+                    "male",
+                    "female"
+                ):
 
-                    result = replace_face(
-                        result,
-                        bbox,
-                        male_source_face
+                    result = (
+                        apply_synthetic_effect(
+                            result,
+                            bbox,
+                            gender
+                        )
                     )
 
-                # Female → Female
-                elif gender == "female":
-
-                    result = replace_face(
-                        result,
-                        bbox,
-                        female_source_face
-                    )
-
-            # Add disclosure
             result = add_watermark(
                 result
             )
@@ -574,15 +546,12 @@ def process_video(
 
             frame_number += 1
 
-            progress = (
-                frame_number /
-                max(total_frames, 1)
-            )
-
             if progress_callback:
 
                 progress_callback(
-                    progress
+                    frame_number
+                    /
+                    max(total, 1)
                 )
 
     finally:
@@ -594,7 +563,7 @@ def process_video(
 
 
 # ============================================================
-# RESTORE ORIGINAL AUDIO
+# RESTORE AUDIO
 # ============================================================
 
 def combine_video_audio(
@@ -604,9 +573,7 @@ def combine_video_audio(
 ):
 
     command = [
-
         "ffmpeg",
-
         "-y",
 
         "-i",
@@ -648,47 +615,41 @@ def combine_video_audio(
     if result.returncode != 0:
 
         raise RuntimeError(
-            "FFmpeg error:\n\n"
-            + result.stderr[-3000:]
+            result.stderr[-3000:]
         )
 
     return final_output
 
 
 # ============================================================
-# MAIN BACKEND FUNCTION
+# BACKEND
 # ============================================================
 
 def create_synthetic_video(
     male_file,
     female_file,
     target_file,
-    gender_model_file,
+    detector,
+    classifier,
     progress_callback=None
 ):
 
-    with tempfile.TemporaryDirectory() as temp:
+    with tempfile.TemporaryDirectory() as temp_dir:
 
-        temp = Path(temp)
+        temp = Path(temp_dir)
 
-        # Temporary input files
         male_path = (
-            temp / "male_source.jpg"
+            temp / "male.jpg"
         )
 
         female_path = (
-            temp / "female_source.jpg"
+            temp / "female.jpg"
         )
 
         target_path = (
             temp / "target.mp4"
         )
 
-        model_path = (
-            temp / "gender_net.onnx"
-        )
-
-        # Temporary video files
         processed_path = (
             temp / "processed.mp4"
         )
@@ -697,7 +658,7 @@ def create_synthetic_video(
             temp / "synthetic_video.mp4"
         )
 
-        # Save uploads temporarily
+        # Save uploads
         with open(
             male_path,
             "wb"
@@ -725,16 +686,6 @@ def create_synthetic_video(
                 target_file.getbuffer()
             )
 
-        with open(
-            model_path,
-            "wb"
-        ) as f:
-
-            f.write(
-                gender_model_file.getbuffer()
-            )
-
-        # Read source images
         male_image = cv2.imread(
             str(male_path)
         )
@@ -744,86 +695,41 @@ def create_synthetic_video(
         )
 
         if male_image is None:
-
             raise ValueError(
-                "Could not read male source image."
+                "Could not read male image."
             )
 
         if female_image is None:
-
             raise ValueError(
-                "Could not read female source image."
+                "Could not read female image."
             )
 
-        # Load detector
-        detector = FaceDetector()
-
-        # Load gender classifier
-        gender_classifier = GenderClassifier(
-            model_path
-        )
-
-        # Find source faces
-        male_bbox = detector.largest(
-            male_image
-        )
-
-        female_bbox = detector.largest(
-            female_image
-        )
-
-        # Extract source faces
-        male_source_face = extract_source_face(
-            male_image,
-            male_bbox
-        )
-
-        female_source_face = extract_source_face(
-            female_image,
-            female_bbox
-        )
-
-        # Process video
         process_video(
-
             target_path,
-
             processed_path,
-
             detector,
-
-            gender_classifier,
-
-            male_source_face,
-
-            female_source_face,
-
+            classifier,
             progress_callback
         )
 
-        # Restore original audio
         combine_video_audio(
-
             processed_path,
-
             target_path,
-
             final_path
         )
 
-        # Read final video into memory
         with open(
             final_path,
             "rb"
         ) as f:
 
-            result_bytes = f.read()
+            output = f.read()
 
-    return result_bytes
+    return output
 
 
 # ============================================================
-# STREAMLIT APP
+# STREAMLIT UI
 # ============================================================
 
 st.title(
@@ -831,20 +737,47 @@ st.title(
 )
 
 st.write(
-    "Authorized / consenting face-swap demonstration"
+    "Authorized synthetic-media demonstration"
 )
 
 st.warning(
-    "Use only faces and videos you have permission to process. "
-    "The generated video contains a synthetic-media watermark."
+    "Use only media for which you have permission. "
+    "The output is visibly labeled as synthetic media."
 )
 
 
 # ============================================================
-# UPLOAD SECTION
+# MODEL
 # ============================================================
 
-st.header("1. Upload Source Images")
+st.header(
+    "🧠 Gender Model"
+)
+
+if not MODEL_PATH.exists():
+
+    st.error(
+        "gender_net.onnx is missing."
+    )
+
+    st.code(
+        str(MODEL_PATH)
+    )
+
+    st.stop()
+
+st.success(
+    "✅ gender_net.onnx found"
+)
+
+
+# ============================================================
+# UPLOADS
+# ============================================================
+
+st.header(
+    "1. Upload Source Images"
+)
 
 col1, col2 = st.columns(2)
 
@@ -871,7 +804,9 @@ with col2:
     )
 
 
-st.header("2. Upload Target Video")
+st.header(
+    "2. Upload Target Video"
+)
 
 target_file = st.file_uploader(
     "🎬 Target Video",
@@ -883,43 +818,27 @@ target_file = st.file_uploader(
 )
 
 
-st.header("3. Upload Gender Model")
-
-gender_model_file = st.file_uploader(
-    "🧠 gender_net.onnx",
-    type=[
-        "onnx"
-    ]
-)
-
-
 # ============================================================
-# PREVIEWS
+# PREVIEW
 # ============================================================
 
 if male_file:
 
-    st.subheader("Male Source")
-
     st.image(
         male_file,
-        width=300
+        width=250,
+        caption="Male source"
     )
-
 
 if female_file:
 
-    st.subheader("Female Source")
-
     st.image(
         female_file,
-        width=300
+        width=250,
+        caption="Female source"
     )
 
-
 if target_file:
-
-    st.subheader("Target Video")
 
     st.video(
         target_file
@@ -930,23 +849,19 @@ if target_file:
 # GENERATE
 # ============================================================
 
-st.header("4. Generate")
-
-generate_button = st.button(
+generate = st.button(
     "🚀 Generate Synthetic Video",
     type="primary",
     use_container_width=True
 )
 
 
-if generate_button:
-
-    # Validation
+if generate:
 
     if male_file is None:
 
         st.error(
-            "Please upload the male source image."
+            "Upload the male source image."
         )
 
         st.stop()
@@ -954,7 +869,7 @@ if generate_button:
     if female_file is None:
 
         st.error(
-            "Please upload the female source image."
+            "Upload the female source image."
         )
 
         st.stop()
@@ -962,42 +877,38 @@ if generate_button:
     if target_file is None:
 
         st.error(
-            "Please upload the target video."
+            "Upload the target video."
         )
 
         st.stop()
 
-    if gender_model_file is None:
-
-        st.error(
-            "Please upload gender_net.onnx."
-        )
-
-        st.stop()
-
-    # Progress
-
-    progress_bar = st.progress(
-        0
-    )
+    progress = st.progress(0)
 
     status = st.empty()
 
     try:
 
-        def update_progress(
-            progress
-        ):
+        status.info(
+            "Loading models..."
+        )
+
+        detector = FaceDetector()
+
+        classifier = GenderClassifier(
+            MODEL_PATH
+        )
+
+        def update_progress(value):
 
             value = max(
                 0.0,
                 min(
                     1.0,
-                    float(progress)
+                    float(value)
                 )
             )
 
-            progress_bar.progress(
+            progress.progress(
                 value
             )
 
@@ -1006,63 +917,44 @@ if generate_button:
                 f"{value * 100:.1f}%"
             )
 
-        # Run backend
-
-        video_bytes = create_synthetic_video(
-
+        output = create_synthetic_video(
             male_file,
-
             female_file,
-
             target_file,
-
-            gender_model_file,
-
+            detector,
+            classifier,
             update_progress
         )
 
-        progress_bar.progress(
-            1.0
-        )
+        progress.progress(1.0)
 
         status.success(
-            "✅ Video processing completed!"
+            "✅ Processing completed!"
         )
 
-        # Output
-
         st.header(
-            "🎬 Generated Video"
+            "🎬 Output"
         )
 
         st.video(
-            video_bytes
+            output
         )
 
-        # Download
-
         st.download_button(
-
-            label="⬇️ Download Synthetic Video",
-
-            data=video_bytes,
-
+            "⬇️ Download Synthetic Video",
+            data=output,
             file_name="synthetic_video.mp4",
-
             mime="video/mp4",
-
             use_container_width=True
         )
 
     except Exception as error:
 
         status.error(
-            "❌ Processing failed."
+            "❌ Processing failed"
         )
 
-        st.exception(
-            error
-        )
+        st.exception(error)
 
 
 # ============================================================
